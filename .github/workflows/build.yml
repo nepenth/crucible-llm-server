@@ -2,7 +2,7 @@ name: Build iOS IPA
 
 on:
   push:
-    branches: [master]
+    branches: [master, ios14-build]
   workflow_dispatch:
 
 jobs:
