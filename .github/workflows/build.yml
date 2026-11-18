@@ -32,6 +32,10 @@ jobs:
         run: |
           cd llama.cpp
           chmod +x build-xcframework.sh
+          # The script hard-codes IOS_MIN_OS_VERSION=16.4, overriding the environment.
+          # Make it honour the env var (runner checkout only; submodule pin unchanged).
+          sed -i '' 's/^IOS_MIN_OS_VERSION=16\.4$/IOS_MIN_OS_VERSION=${IOS_MIN_OS_VERSION:-16.4}/' build-xcframework.sh
+          grep -n '^IOS_MIN_OS_VERSION=' build-xcframework.sh
           IOS_MIN_OS_VERSION=14.0 ./build-xcframework.sh
           ls -la build-apple/llama.xcframework/
 
