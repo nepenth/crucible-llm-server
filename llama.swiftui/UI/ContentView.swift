@@ -40,7 +40,7 @@ struct ContentView: View {
                         UIPasteboard.general.string = llamaState.messageLog
                     }
                 }
-                .buttonStyle(.bordered)
+                .modifier(BorderedIfAvailable())
                 .padding()
 
                 HStack {
@@ -55,7 +55,7 @@ struct ContentView: View {
                             .foregroundColor(.secondary)
                     }
                 }
-                .buttonStyle(.bordered)
+                .modifier(BorderedIfAvailable())
                 .padding(.horizontal)
 
                 NavigationLink(destination: DrawerView(llamaState: llamaState)) {
@@ -160,6 +160,18 @@ struct ContentView: View {
                     }
                 }
             }
+        }
+    }
+}
+
+// .buttonStyle(.bordered) requires iOS 15; fall back to the default style on iOS 14.
+private struct BorderedIfAvailable: ViewModifier {
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(iOS 15.0, *) {
+            content.buttonStyle(.bordered)
+        } else {
+            content
         }
     }
 }

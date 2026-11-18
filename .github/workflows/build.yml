@@ -17,18 +17,35 @@ jobs:
         run: |
           # List available Xcode versions
           ls /Applications/ | grep Xcode
-          # Use latest available Xcode
-          XCODE_PATH=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          # Pin Xcode 16.4: Xcode 26+ only supports iOS 15+ deployment targets,
+          # and this build must run on iOS 14.7.1.
+          XCODE_PATH=/Applications/Xcode_16.4.app
+          test -d "$XCODE_PATH" || { echo "::error::$XCODE_PATH not found on runner"; exit 1; }
           echo "Using $XCODE_PATH"
           sudo xcode-select -s "$XCODE_PATH"
+          xcodebuild -version
           xcodebuild -showsdks | grep -i ios
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "iphoneos SDK minimum deployment target: $(plutil -extract SupportedTargets.iphoneos.MinimumDeploymentTarget raw "$SDK/SDKSettings.plist")"
 
       - name: Build llama.cpp xcframework
         run: |
           cd llama.cpp
           chmod +x build-xcframework.sh
-          ./build-xcframework.sh
+          IOS_MIN_OS_VERSION=14.0 ./build-xcframework.sh
           ls -la build-apple/llama.xcframework/
+
+      - name: Check Metal shaders compile for iOS 14 (Metal 2.3)
+        continue-on-error: true
+        run: |
+          # The app compiles this embedded source on-device at runtime; on iOS 14 the
+          # language level is Metal 2.3. iPhone 11 (Apple6) sets GGML_METAL_HAS_BF16.
+          SRC=$(find llama.cpp/build-ios-device -name ggml-metal-embed.metal | head -1)
+          echo "Source: $SRC"
+          xcrun -sdk iphoneos metal -c -std=ios-metal2.3 -target air64-apple-ios14.0 \
+            -DGGML_METAL_EMBED_LIBRARY=1 -DGGML_METAL_HAS_BF16=1 \
+            "$SRC" -o "$RUNNER_TEMP/ggml-ios14.air"
+          echo "Metal 2.3 compile OK"
 
       - name: Build iOS app
         run: |
@@ -56,3 +73,21 @@ jobs:
         with:
           name: CrucibleLLM
           path: CrucibleLLM.ipa
+
+      - name: Verify iOS 14 deployment target
+        run: |
+          APP=$(ls -d Payload/*.app | head -1)
+          BIN="$APP/$(plutil -extract CFBundleExecutable raw "$APP/Info.plist")"
+          FW="$APP/Frameworks/llama.framework/llama"
+          MINOS_PLIST=$(plutil -extract MinimumOSVersion raw "$APP/Info.plist")
+          echo "App: $APP"
+          echo "Info.plist MinimumOSVersion: $MINOS_PLIST"
+          echo "Frameworks:"; ls "$APP/Frameworks"
+          echo "Swift runtime linkage:"; otool -L "$BIN" | grep -i swift || true
+          fail=0
+          [ "$MINOS_PLIST" = "14.0" ] || { echo "::error::MinimumOSVersion is $MINOS_PLIST"; fail=1; }
+          for f in "$BIN" "$FW"; do
+            echo "== $f"; xcrun vtool -show-build "$f"
+            xcrun vtool -show-build "$f" | grep -qE 'minos 14\.0$' || { echo "::error::$f minos is not 14.0"; fail=1; }
+          done
+          exit $fail
