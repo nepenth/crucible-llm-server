@@ -7,6 +7,8 @@ struct DownloadButton: View {
     private var filename: String
     private var sizeLabel: String?
     private var isLarge: Bool
+    private var blurb: String?
+    private var expectedBytes: Int64?
 
     @State private var status: String
     @State private var errorText: String?
@@ -20,13 +22,15 @@ struct DownloadButton: View {
     }
 
     init(llamaState: LlamaState, modelName: String, modelUrl: String, filename: String,
-         sizeLabel: String? = nil, isLarge: Bool = false) {
+         sizeLabel: String? = nil, isLarge: Bool = false, blurb: String? = nil, expectedBytes: Int64? = nil) {
         self.llamaState = llamaState
         self.modelName = modelName
         self.modelUrl = modelUrl
         self.filename = filename
         self.sizeLabel = sizeLabel
         self.isLarge = isLarge
+        self.blurb = blurb
+        self.expectedBytes = expectedBytes
 
         let fileURL = DownloadButton.getFileURL(filename: filename)
         _status = State(initialValue: FileManager.default.fileExists(atPath: fileURL.path) ? "downloaded" : "download")
@@ -34,6 +38,10 @@ struct DownloadButton: View {
 
     private func download() {
         guard let url = URL(string: modelUrl) else { return }
+        if let expectedBytes, llamaState.freeDiskBytes() < expectedBytes + 300_000_000 {
+            errorText = "Not enough free space. Free up \(String(format: "%.1f", Double(expectedBytes + 300_000_000 - llamaState.freeDiskBytes()) / 1e9)) GB or delete another model."
+            return
+        }
         status = "downloading"
         errorText = nil
         progress = 0
@@ -84,7 +92,7 @@ struct DownloadButton: View {
     }
 
     private var details: String {
-        [sizeLabel, isLarge ? "Large – slower, uses the most memory" : nil]
+        [sizeLabel, blurb, isLarge ? "Large: slower, uses the most memory" : nil]
             .compactMap { $0 }
             .joined(separator: " · ")
     }

@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 import os
 
 struct Model: Identifiable {
@@ -13,6 +14,10 @@ struct Model: Identifiable {
     var isLarge = false
     /// Names older builds saved this file under (the old downloader cut names at the first ".").
     var legacyFilenames: [String] = []
+    /// Exact file size from Hugging Face; a smaller file on disk is an incomplete download.
+    var expectedBytes: Int64? = nil
+    /// One line on why this model is on the list.
+    var blurb: String? = nil
 }
 
 /// Breadcrumb log that survives a crash: each step is written to disk before it starts, so after
@@ -68,10 +73,10 @@ enum Diagnostics {
     }
 }
 
-struct ChatMessage: Identifiable, Equatable {
-    enum Role: String { case user, assistant }
+struct ChatMessage: Identifiable, Equatable, Codable {
+    enum Role: String, Codable { case user, assistant }
 
-    let id = UUID()
+    var id = UUID()
     let role: Role
     var text: String
     /// App-generated notice shown in the chat but never sent to the model.
@@ -88,6 +93,7 @@ class LlamaState: ObservableObject {
     @Published var isGenerating = false
     @Published var loadedModelName: String?
     @Published var isLoadingModel = false
+    @Published var modelLoadError: String?
     /// Set at launch when the previous run ended in the middle of a step (likely a crash).
     @Published var previousCrashNote: String?
     /// First message that was still inside the assistant's memory for the latest reply.
@@ -107,6 +113,31 @@ class LlamaState: ObservableObject {
     /// Streamed text is applied to the UI at most this often, so long replies don't re-render per token.
     private let streamFlushInterval: UInt64 = 80_000_000 // ns
     private static let systemPromptKey = "customSystemPrompt"
+    private static let lastModelKey = "lastModelFilename"
+    private static let briefAnswersKey = "briefAnswers"
+    /// Reply length cap while "Brief answers" is on: shorter replies save battery and time.
+    private let briefReplyTokenCap = 320
+
+    /// Short answers by default; each reply costs battery on a phone that may not be recharged soon.
+    @Published var briefAnswers: Bool = UserDefaults.standard.object(forKey: LlamaState.briefAnswersKey) as? Bool ?? true {
+        didSet { UserDefaults.standard.set(briefAnswers, forKey: Self.briefAnswersKey) }
+    }
+
+    /// Starter questions shown on an empty chat, so help is one tap away under stress.
+    let quickQuestions: [String] = [
+        "Someone is bleeding heavily. What do I do?",
+        "How do I treat a burn?",
+        "How do I do CPR on an adult?",
+        "Signs of hypothermia and what to do",
+        "How can I make water safe to drink?",
+        "How do I signal for rescue?",
+    ]
+
+    private static let chatURL: URL = {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("chat.json")
+    }()
 
     @Published var cacheCleared = false
     @Published var downloadedModels: [Model] = []
@@ -124,13 +155,62 @@ class LlamaState: ObservableObject {
     }
 
     init() {
-        if let unfinished = Diagnostics.startSession() {
+        let unfinished = Diagnostics.startSession()
+        if let unfinished {
             previousCrashNote = "The app closed unexpectedly last time during: \(unfinished)"
             messageLog += (previousCrashNote ?? "") + "\n"
         }
         systemPrompt = UserDefaults.standard.string(forKey: Self.systemPromptKey) ?? defaultSystemPrompt
+        restoreChat()
         loadModelsFromDisk()
         loadDefaultModels()
+        autoLoadLastModel(skip: unfinished?.contains("BEGIN load") == true)
+    }
+
+    /// Reloads the model used last time, so the app is ready to answer as soon as it opens.
+    /// Skipped when the previous run died while loading, to avoid a crash loop.
+    private func autoLoadLastModel(skip: Bool) {
+        guard let filename = UserDefaults.standard.string(forKey: Self.lastModelKey) else { return }
+        let url = getDocumentsDirectory().appendingPathComponent(filename)
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        if skip {
+            messageLog += "Not reloading \(filename) automatically because the last load did not finish.\n"
+            return
+        }
+        try? loadModel(modelUrl: url)
+    }
+
+    // MARK: Chat persistence (the app may be closed by iOS at any time; keep the instructions)
+
+    private func restoreChat() {
+        guard let data = try? Data(contentsOf: Self.chatURL),
+              let saved = try? JSONDecoder().decode([ChatMessage].self, from: data) else { return }
+        messages = saved.filter { !$0.text.isEmpty }
+    }
+
+    private func saveChat() {
+        guard let data = try? JSONEncoder().encode(messages.filter { !$0.text.isEmpty }) else { return }
+        try? data.write(to: Self.chatURL, options: .atomic)
+    }
+
+    /// Free space for downloads, in bytes.
+    func freeDiskBytes() -> Int64 {
+        let values = try? getDocumentsDirectory().resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        return values?.volumeAvailableCapacityForImportantUsage ?? 0
+    }
+
+    /// Checks a model file before loading: a truncated or non-GGUF file would otherwise crash llama.cpp.
+    private func validateModelFile(_ url: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return "The file can't be opened." }
+        let magic = handle.readData(ofLength: 4)
+        handle.closeFile()
+        guard magic == Data("GGUF".utf8) else { return "This isn't a GGUF model file (or the download is damaged)." }
+        if let expected = catalogEntry(forFilename: url.lastPathComponent)?.expectedBytes,
+           let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? Int64,
+           size < expected {
+            return "The download is incomplete (\(size / 1_000_000) of \(expected / 1_000_000) MB)."
+        }
+        return nil
     }
 
     private func loadModelsFromDisk() {
@@ -187,44 +267,51 @@ class LlamaState: ObservableObject {
         let paths = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
         return paths[0]
     }
-    /// Default download list for the iPhone 11 (4 GB RAM), small to large. Sizes and links from
-    /// the keep-survivalpi-phone-models packet (verified 2026-11-18).
+    /// Default download list for the iPhone 11 (4 GB RAM), small to large. Every model is
+    /// <= 2.1 GB (Q4_K_M) so weights + context stay under the phone's ~2.5 GB budget, and every
+    /// architecture is supported by the pinned llama.cpp. Links and byte sizes checked 2026-11-19.
     let defaultModels: [Model] = [
         Model(
             name: "LFM2.5 1.2B Instruct",
             url: "https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF/resolve/main/LFM2.5-1.2B-Instruct-Q4_K_M.gguf",
             filename: "LFM2.5-1.2B-Instruct-Q4_K_M.gguf", status: "download",
-            sizeLabel: "0.73 GB", legacyFilenames: ["LFM2"]
+            sizeLabel: "0.73 GB", legacyFilenames: ["LFM2"], expectedBytes: 730_895_168,
+            blurb: "Fastest and lightest on battery"
         ),
         Model(
             name: "Atlas First Aid 1.5B",
             url: "https://huggingface.co/Kami574/Atlas-FirstAid/resolve/main/Atlas-FirstAid.Q4_K_M.gguf",
             filename: "Atlas-FirstAid.Q4_K_M.gguf", status: "download",
-            sizeLabel: "0.99 GB", legacyFilenames: ["Atlas-FirstAid"]
+            sizeLabel: "0.99 GB", legacyFilenames: ["Atlas-FirstAid"], expectedBytes: 986_048_096,
+            blurb: "First-aid specialist"
         ),
         Model(
-            name: "Qwen2.5 1.5B Instruct",
-            url: "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
-            filename: "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf", status: "download",
-            sizeLabel: "0.99 GB", legacyFilenames: ["Qwen2"]
-        ),
-        Model(
-            name: "SmolLM2 1.7B Instruct",
-            url: "https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF/resolve/main/smollm2-1.7b-instruct-q4_k_m.gguf",
-            filename: "smollm2-1.7b-instruct-q4_k_m.gguf", status: "download",
-            sizeLabel: "1.06 GB", legacyFilenames: ["smollm2-1"]
+            name: "Qwen3.5 2B",
+            url: "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_K_M.gguf",
+            filename: "Qwen3.5-2B-Q4_K_M.gguf", status: "download",
+            sizeLabel: "1.28 GB", expectedBytes: 1_280_835_840,
+            blurb: "Newest general model; best all-round for its size"
         ),
         Model(
             name: "Gemma 2 2B IT",
             url: "https://huggingface.co/bartowski/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf",
             filename: "gemma-2-2b-it-Q4_K_M.gguf", status: "download",
-            sizeLabel: "1.71 GB", legacyFilenames: ["gemma-2-2b-it-Q4_K_M"]
+            sizeLabel: "1.71 GB", legacyFilenames: ["gemma-2-2b-it-Q4_K_M"], expectedBytes: 1_708_582_752,
+            blurb: "Broad general knowledge"
+        ),
+        Model(
+            name: "PocketSurvivor 3B",
+            url: "https://huggingface.co/mfielding92/PocketSurvivor-3B/resolve/main/PocketSurvivor-3B-Q4_K_M.gguf",
+            filename: "PocketSurvivor-3B-Q4_K_M.gguf", status: "download",
+            sizeLabel: "2.02 GB", isLarge: true, expectedBytes: 2_019_377_984,
+            blurb: "Survival specialist (shelter, water, injuries, disasters)"
         ),
         Model(
             name: "Llama 3.2 3B Instruct",
             url: "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
             filename: "Llama-3.2-3B-Instruct-Q4_K_M.gguf", status: "download",
-            sizeLabel: "2.02 GB", isLarge: true, legacyFilenames: ["Llama-3"]
+            sizeLabel: "2.02 GB", isLarge: true, legacyFilenames: ["Llama-3"], expectedBytes: 2_019_377_696,
+            blurb: "Best general quality that fits"
         ),
     ]
 
@@ -242,6 +329,12 @@ class LlamaState: ObservableObject {
         guard !isLoadingModel else { return }
 
         let filename = modelUrl.lastPathComponent
+        if let problem = validateModelFile(modelUrl) {
+            messageLog += "Could not load \(filename): \(problem) Delete it and download it again.\n"
+            modelLoadError = "\(problem) Delete it and download it again."
+            return
+        }
+        modelLoadError = nil
         let displayName = catalogEntry(forFilename: filename)?.name ?? modelUrl.deletingPathExtension().lastPathComponent
         isLoadingModel = true
         llamaContext = nil
@@ -261,10 +354,12 @@ class LlamaState: ObservableObject {
                     systemPrompt = defaultSystemPrompt
                 }
                 messageLog += "Loaded \(filename)\n"
+                UserDefaults.standard.set(filename, forKey: Self.lastModelKey)
                 Diagnostics.mark("END load \(filename)")
                 updateDownloadedModels(modelName: filename, status: "downloaded")
             } catch {
                 messageLog += "Could not load \(filename). The file may be incomplete; delete it and download again.\n"
+                modelLoadError = "Could not load this model. Delete it and download it again."
                 Diagnostics.mark("END load failed \(filename)")
             }
             isLoadingModel = false
@@ -289,7 +384,12 @@ class LlamaState: ObservableObject {
                 are reachable. Only give standard first-aid guidance; never invent treatments.
                 """
         }
-        return "You are a helpful assistant running offline on a phone. Answer clearly and concisely."
+        return """
+            You are an offline survival and first-aid assistant on a phone with no internet. \
+            Give practical, step-by-step answers with the most urgent safety steps first. \
+            Be clear and brief. Say when to get professional help or contact emergency services \
+            if they are reachable. If you are not sure, say so instead of guessing.
+            """
     }
 
     private func saveSystemPrompt() {
@@ -309,6 +409,7 @@ class LlamaState: ObservableObject {
         guard !isGenerating else { return }
         messages.removeAll()
         memoryStartID = nil
+        saveChat()
     }
 
     func stopGenerating() {
@@ -327,7 +428,9 @@ class LlamaState: ObservableObject {
         messages.append(reply)
         scrollTick += 1
 
-        let system = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        var system = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if briefAnswers { system += (system.isEmpty ? "" : " ") + "Keep answers short." }
+        saveChat()
         Task {
             await generateReply(context: llamaContext, system: system, history: history, replyID: reply.id)
         }
@@ -360,9 +463,14 @@ class LlamaState: ObservableObject {
     }
 
     private func generateReply(context: LlamaContext, system: String, history: [ChatMessage], replyID: UUID) async {
+        // If the screen locks mid-reply iOS suspends the app and GPU work is not allowed in the
+        // background, so keep the screen on while a reply is being written.
+        UIApplication.shared.isIdleTimerDisabled = true
         defer {
+            UIApplication.shared.isIdleTimerDisabled = false
             isGenerating = false
             scrollTick += 1
+            saveChat()
         }
 
         guard let built = await buildPrompt(context: context, system: system, history: history) else {
@@ -384,9 +492,12 @@ class LlamaState: ObservableObject {
         var nTokens = 0
         var lastFlush = t_first
 
+        let tokenCap = briefAnswers ? briefReplyTokenCap : Int.max
+        var hitCap = false
         while await !context.is_done, !stopRequested {
             pending += await context.completion_loop()
             nTokens += 1
+            if nTokens >= tokenCap { hitCap = true; break }
 
             let now = DispatchTime.now().uptimeNanoseconds
             if now - lastFlush >= streamFlushInterval {
@@ -394,7 +505,7 @@ class LlamaState: ObservableObject {
                 pending = ""
                 lastFlush = now
                 if Self.trimAtTurnMarker(&reply) { break }
-                setReply(replyID, reply.trimmingCharacters(in: .whitespacesAndNewlines))
+                setReply(replyID, Self.visibleText(reply))
             }
         }
         reply += pending
@@ -402,7 +513,8 @@ class LlamaState: ObservableObject {
         let t_end = DispatchTime.now().uptimeNanoseconds
         await context.clear()
 
-        var finalText = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+        var finalText = Self.visibleText(reply)
+        if hitCap && !stopRequested { finalText += " …\n\n(Shortened to save battery. Ask \"continue\" or turn off Brief Answers in Settings.)" }
         if stopRequested { finalText += finalText.isEmpty ? "(Stopped)" : " …(stopped)" }
         setReply(replyID, finalText)
 
@@ -410,6 +522,19 @@ class LlamaState: ObservableObject {
         let tokensPerSecond = Double(nTokens) / max(Double(t_end - t_first) / NS_PER_S, 0.001)
         lastStats = String(format: "%.1f tok/s, first word after %.1f s", tokensPerSecond, secondsToFirst)
         Diagnostics.mark("END reply (\(nTokens) tokens, \(lastStats ?? ""))")
+    }
+
+    /// Hides a model's private reasoning (<think>…</think>, used by Qwen 3.x) from the chat.
+    private static func visibleText(_ text: String) -> String {
+        var out = text
+        while let open = out.range(of: "<think>") {
+            if let close = out.range(of: "</think>", range: open.upperBound..<out.endIndex) {
+                out.removeSubrange(open.lowerBound..<close.upperBound)
+            } else {
+                out.removeSubrange(open.lowerBound..<out.endIndex)
+            }
+        }
+        return out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Cuts the reply at a leaked chat-template marker (the model started a new turn).

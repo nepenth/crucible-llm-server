@@ -95,6 +95,12 @@ struct ContentView: View {
                             Text("Loading model…")
                         }
                     }
+                } else if let error = llamaState.modelLoadError {
+                    Section {
+                        Text(error)
+                            .foregroundColor(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 Section(header: Text("On This Phone"),
                         footer: Text("Tap a model to load it. Swipe left to delete it and free space.")) {
@@ -109,10 +115,11 @@ struct ContentView: View {
                 }
                 if !llamaState.undownloadedModels.isEmpty {
                     Section(header: Text("Download Models"),
-                            footer: Text("Smallest first. Downloads need Wi-Fi or mobile data; keep the app open until they finish.")) {
+                            footer: Text("Smallest first. Download at least one model now, while you have internet: after that everything works offline. Keep this screen open until downloads finish. Free space: \(String(format: "%.1f", Double(llamaState.freeDiskBytes()) / 1e9)) GB.")) {
                         ForEach(llamaState.undownloadedModels) { model in
                             DownloadButton(llamaState: llamaState, modelName: model.name, modelUrl: model.url,
-                                           filename: model.filename, sizeLabel: model.sizeLabel, isLarge: model.isLarge)
+                                           filename: model.filename, sizeLabel: model.sizeLabel, isLarge: model.isLarge,
+                                           blurb: model.blurb, expectedBytes: model.expectedBytes)
                         }
                     }
                 }
@@ -174,7 +181,12 @@ private struct ChatTranscript: View {
                 // and LazyVStack's scrollTo is unreliable on iOS 14 while content grows.
                 VStack(alignment: .leading, spacing: 0) {
                     if llamaState.messages.isEmpty {
-                        EmptyChatView(hasModel: llamaState.hasModel, onChooseModel: onChooseModel)
+                        EmptyChatView(hasModel: llamaState.hasModel,
+                                      hasDownloadedModel: !llamaState.downloadedModels.isEmpty,
+                                      isLoading: llamaState.isLoadingModel,
+                                      questions: llamaState.quickQuestions,
+                                      onAsk: { llamaState.send($0) },
+                                      onChooseModel: onChooseModel)
                     }
                     ForEach(llamaState.messages) { message in
                         if message.id == llamaState.memoryStartID && message.id != llamaState.messages.first?.id {
@@ -245,32 +257,70 @@ private struct MessageRow: View {
 
 private struct EmptyChatView: View {
     let hasModel: Bool
+    let hasDownloadedModel: Bool
+    let isLoading: Bool
+    let questions: [String]
+    let onAsk: (String) -> Void
     let onChooseModel: () -> Void
 
     var body: some View {
         VStack(spacing: 12) {
-            Image(systemName: hasModel ? "bubble.left.and.bubble.right" : "square.and.arrow.down")
-                .font(.system(size: 36))
-                .foregroundColor(.secondary)
-            Text(hasModel ? "Ask a question" : "No model loaded")
-                .font(.title3)
-                .fontWeight(.semibold)
-            Text(hasModel
-                 ? "Answers are generated on this phone, with no internet needed. The assistant remembers recent messages in this chat; the oldest are forgotten to fit the phone's memory."
-                 : "Download or choose a model to start. Everything runs on this phone, with no internet needed after the download.")
-                .font(.callout)
-                .foregroundColor(.secondary)
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
-            if !hasModel {
-                Button("Choose a Model", action: onChooseModel)
+            if hasModel {
+                Text("What do you need help with?")
+                    .font(.title3)
+                    .fontWeight(.semibold)
+                VStack(spacing: 8) {
+                    ForEach(questions, id: \.self) { question in
+                        Button(action: { onAsk(question) }) {
+                            Text(question)
+                                .font(.body)
+                                .multilineTextAlignment(.leading)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 10)
+                                .background(Color(.secondarySystemBackground))
+                                .cornerRadius(10)
+                        }
+                    }
+                }
+                Text("Works without internet. Or type your own question below.")
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if isLoading {
+                ProgressView()
+                Text("Loading model…")
+                    .font(.title3)
+                    .fontWeight(.semibold)
+            } else {
+                Image(systemName: hasDownloadedModel ? "cpu" : "square.and.arrow.down")
+                    .font(.system(size: 36))
+                    .foregroundColor(.secondary)
+                Text(hasDownloadedModel ? "No model loaded" : "Get ready before you need it")
+                    .font(.title3)
+                    .fontWeight(.semibold)
+                Text(hasDownloadedModel
+                     ? "Choose a model to start. Everything runs on this phone."
+                     : "Download a model now, while you have internet. After that, the assistant works with no signal at all.")
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button(hasDownloadedModel ? "Choose a Model" : "Download a Model", action: onChooseModel)
                     .font(.headline)
                     .padding(.top, 4)
             }
+            Text("AI answers can be wrong. If you can reach emergency services, contact them first.")
+                .font(.footnote)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.top, 8)
         }
         .frame(maxWidth: .infinity)
-        .padding(.horizontal, 32)
-        .padding(.top, 48)
+        .padding(.horizontal, 24)
+        .padding(.top, 32)
     }
 }
 
@@ -381,6 +431,10 @@ private struct SettingsView: View {
                         Text("Download or Switch Model")
                     }
                     .disabled(llamaState.isGenerating)
+                }
+
+                Section(footer: Text("Short replies use less battery and arrive sooner. Ask \"continue\" for more.")) {
+                    Toggle("Brief Answers", isOn: $llamaState.briefAnswers)
                 }
 
                 Section(header: Text("Assistant Instructions"),
