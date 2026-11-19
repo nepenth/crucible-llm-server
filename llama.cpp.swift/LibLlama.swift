@@ -290,6 +290,36 @@ actor LlamaContext {
         return result;
     }
 
+    /// Number of tokens `text` occupies in the prompt (including BOS when the model uses one).
+    func token_count(text: String) -> Int {
+        return tokenize(text: text, add_bos: true).count
+    }
+
+    /// Formats a conversation with the model's built-in chat template, ending with an open
+    /// assistant turn. Falls back to ChatML when the template is missing or unrecognised.
+    func format_chat(_ messages: [(role: String, content: String)]) -> String {
+        let tmpl = llama_model_chat_template(model, nil)
+        let roles = messages.map { strdup($0.role)! }
+        let contents = messages.map { strdup($0.content)! }
+        defer {
+            roles.forEach { free($0) }
+            contents.forEach { free($0) }
+        }
+        var chat = zip(roles, contents).map { llama_chat_message(role: UnsafePointer($0), content: UnsafePointer($1)) }
+
+        let estimate = messages.reduce(256) { $0 + $1.role.utf8.count + $1.content.utf8.count + 64 }
+        var buf = [CChar](repeating: 0, count: estimate * 2)
+        var n = llama_chat_apply_template(tmpl, &chat, chat.count, true, &buf, Int32(buf.count))
+        if n > Int32(buf.count) {
+            buf = [CChar](repeating: 0, count: Int(n) + 1)
+            n = llama_chat_apply_template(tmpl, &chat, chat.count, true, &buf, Int32(buf.count))
+        }
+        guard n >= 0 else {
+            return messages.map { "<|im_start|>\($0.role)\n\($0.content)<|im_end|>\n" }.joined() + "<|im_start|>assistant\n"
+        }
+        return String(decoding: buf.prefix(Int(n)).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+    }
+
     func clear() {
         tokens_list.removeAll()
         temporary_invalid_cchars.removeAll()
@@ -300,7 +330,9 @@ actor LlamaContext {
         let utf8Count = text.utf8.count
         let n_tokens = utf8Count + (add_bos ? 1 : 0) + 1
         let tokens = UnsafeMutablePointer<llama_token>.allocate(capacity: n_tokens)
-        let tokenCount = llama_tokenize(vocab, text, Int32(utf8Count), tokens, Int32(n_tokens), add_bos, false)
+        // parse_special = true: chat-template markers such as <|im_start|> must become
+        // control tokens, not literal text, or the model never sees a real turn boundary.
+        let tokenCount = llama_tokenize(vocab, text, Int32(utf8Count), tokens, Int32(n_tokens), add_bos, true)
 
         var swiftTokens: [llama_token] = []
         for i in 0..<tokenCount {

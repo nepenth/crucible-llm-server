@@ -8,9 +8,43 @@ struct Model: Identifiable {
     var status: String?
 }
 
+struct ChatMessage: Identifiable, Equatable {
+    enum Role: String { case user, assistant }
+
+    let id = UUID()
+    let role: Role
+    var text: String
+    /// App-generated notice shown in the chat but never sent to the model.
+    var isNotice = false
+}
+
 @MainActor
 class LlamaState: ObservableObject {
+    /// Activity log (model loading, benchmark, server); shown in Settings, not in the chat.
     @Published var messageLog = ""
+
+    // MARK: Chat state
+    @Published var messages: [ChatMessage] = []
+    @Published var isGenerating = false
+    @Published var loadedModelName: String?
+    /// First message that was still inside the assistant's memory for the latest reply.
+    @Published var memoryStartID: UUID?
+    /// Bumped whenever streamed text is flushed, so the chat view can keep the newest text in view.
+    @Published var scrollTick = 0
+    @Published var lastStats: String?
+    @Published var systemPrompt: String = "" {
+        didSet { saveSystemPrompt() }
+    }
+    private var stopRequested = false
+
+    /// Hard ceiling for the formatted prompt. LibLlama's batch holds 512 tokens and the context
+    /// 1024; staying well below 512 avoids a batch overflow and keeps prompt processing short on
+    /// an A13 CPU (the whole remembered history is re-read every turn), leaving ~570+ tokens to reply.
+    private let promptTokenBudget = 448
+    /// Streamed text is applied to the UI at most this often, so long replies don't re-render per token.
+    private let streamFlushInterval: UInt64 = 80_000_000 // ns
+    private static let systemPromptKey = "customSystemPrompt"
+
     @Published var cacheCleared = false
     @Published var downloadedModels: [Model] = []
     @Published var undownloadedModels: [Model] = []
@@ -27,6 +61,7 @@ class LlamaState: ObservableObject {
     }
 
     init() {
+        systemPrompt = UserDefaults.standard.string(forKey: Self.systemPromptKey) ?? defaultSystemPrompt
         loadModelsFromDisk()
         loadDefaultModels()
     }
@@ -116,8 +151,16 @@ class LlamaState: ObservableObject {
     ]
     func loadModel(modelUrl: URL?) throws {
         if let modelUrl {
+            guard !isGenerating else {
+                messageLog += "Stop the current reply before switching models\n"
+                return
+            }
             messageLog += "Loading model...\n"
             llamaContext = try LlamaContext.create_context(path: modelUrl.path)
+            loadedModelName = modelUrl.deletingPathExtension().lastPathComponent
+            if UserDefaults.standard.string(forKey: Self.systemPromptKey) == nil {
+                systemPrompt = defaultSystemPrompt
+            }
             messageLog += "Loaded model \(modelUrl.lastPathComponent)\n"
 
             // Assuming that the model is successfully loaded, update the downloaded models
@@ -133,41 +176,159 @@ class LlamaState: ObservableObject {
     }
 
 
-    func complete(text: String) async {
-        guard let llamaContext else {
+    // MARK: - Chat
+
+    var hasModel: Bool { llamaContext != nil }
+
+    var defaultSystemPrompt: String {
+        if loadedModelName?.lowercased().contains("atlas") == true {
+            return """
+                You are Atlas, an offline first-aid assistant. Give numbered, step-by-step \
+                instructions with the most urgent life-saving steps first (airway and breathing). \
+                Be direct and brief. Say when to contact emergency services (911 or 112) if they \
+                are reachable. Only give standard first-aid guidance; never invent treatments.
+                """
+        }
+        return "You are a helpful assistant running offline on a phone. Answer clearly and concisely."
+    }
+
+    private func saveSystemPrompt() {
+        let trimmed = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty || systemPrompt == defaultSystemPrompt {
+            UserDefaults.standard.removeObject(forKey: Self.systemPromptKey)
+        } else {
+            UserDefaults.standard.set(systemPrompt, forKey: Self.systemPromptKey)
+        }
+    }
+
+    func resetSystemPrompt() {
+        systemPrompt = defaultSystemPrompt
+    }
+
+    func newChat() {
+        guard !isGenerating else { return }
+        messages.removeAll()
+        memoryStartID = nil
+    }
+
+    func stopGenerating() {
+        stopRequested = true
+    }
+
+    func send(_ text: String) {
+        let question = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !question.isEmpty, !isGenerating, let llamaContext else { return }
+
+        isGenerating = true
+        stopRequested = false
+        messages.append(ChatMessage(role: .user, text: question))
+        let history = messages.filter { !$0.text.isEmpty && !$0.isNotice }
+        let reply = ChatMessage(role: .assistant, text: "")
+        messages.append(reply)
+        scrollTick += 1
+
+        let system = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task {
+            await generateReply(context: llamaContext, system: system, history: history, replyID: reply.id)
+        }
+    }
+
+    /// Picks the longest run of recent messages that fits the token budget, always starting
+    /// on a user turn and always including the newest question.
+    private func buildPrompt(context: LlamaContext, system: String, history: [ChatMessage]) async -> (prompt: String, firstID: UUID)? {
+        func format(from start: Int) async -> String {
+            var turns: [(role: String, content: String)] = []
+            if !system.isEmpty { turns.append((role: "system", content: system)) }
+            turns += history[start...].map { (role: $0.role.rawValue, content: $0.text) }
+            return await context.format_chat(turns)
+        }
+
+        var start = history.count - 1
+        var best = await format(from: start)
+        guard await context.token_count(text: best) <= promptTokenBudget else { return nil }
+
+        var candidate = start - 2
+        while candidate >= 0 {
+            if history[candidate].role != .user { candidate -= 1; continue }
+            let prompt = await format(from: candidate)
+            guard await context.token_count(text: prompt) <= promptTokenBudget else { break }
+            start = candidate
+            best = prompt
+            candidate -= 2
+        }
+        return (best, history[start].id)
+    }
+
+    private func generateReply(context: LlamaContext, system: String, history: [ChatMessage], replyID: UUID) async {
+        defer {
+            isGenerating = false
+            scrollTick += 1
+        }
+
+        guard let built = await buildPrompt(context: context, system: system, history: history) else {
+            setReply(replyID, "That message is too long for this phone's memory. Please shorten it and try again.")
+            if let index = messages.firstIndex(where: { $0.id == replyID }) { messages[index].isNotice = true }
             return
         }
+        memoryStartID = built.firstID
 
         let t_start = DispatchTime.now().uptimeNanoseconds
-        await llamaContext.completion_init(text: text)
-        let t_heat_end = DispatchTime.now().uptimeNanoseconds
-        let t_heat = Double(t_heat_end - t_start) / NS_PER_S
+        await context.completion_init(text: built.prompt)
+        let t_first = DispatchTime.now().uptimeNanoseconds
 
-        messageLog += "\(text)"
+        var reply = ""
+        var pending = ""
+        var nTokens = 0
+        var lastFlush = t_first
 
-        Task.detached {
-            while await !llamaContext.is_done {
-                let result = await llamaContext.completion_loop()
-                await MainActor.run {
-                    self.messageLog += "\(result)"
-                }
-            }
+        while await !context.is_done, !stopRequested {
+            pending += await context.completion_loop()
+            nTokens += 1
 
-            let t_end = DispatchTime.now().uptimeNanoseconds
-            let t_generation = Double(t_end - t_heat_end) / self.NS_PER_S
-            let tokens_per_second = Double(await llamaContext.n_len) / t_generation
-
-            await llamaContext.clear()
-
-            await MainActor.run {
-                self.messageLog += """
-                    \n
-                    Done
-                    Heat up took \(t_heat)s
-                    Generated \(tokens_per_second) t/s\n
-                    """
+            let now = DispatchTime.now().uptimeNanoseconds
+            if now - lastFlush >= streamFlushInterval {
+                reply += pending
+                pending = ""
+                lastFlush = now
+                if Self.trimAtTurnMarker(&reply) { break }
+                setReply(replyID, reply.trimmingCharacters(in: .whitespacesAndNewlines))
             }
         }
+        reply += pending
+        _ = Self.trimAtTurnMarker(&reply)
+        let t_end = DispatchTime.now().uptimeNanoseconds
+        await context.clear()
+
+        var finalText = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+        if stopRequested { finalText += finalText.isEmpty ? "(Stopped)" : " …(stopped)" }
+        setReply(replyID, finalText)
+
+        let secondsToFirst = Double(t_first - t_start) / NS_PER_S
+        let tokensPerSecond = Double(nTokens) / max(Double(t_end - t_first) / NS_PER_S, 0.001)
+        lastStats = String(format: "%.1f tok/s, first word after %.1f s", tokensPerSecond, secondsToFirst)
+    }
+
+    /// Cuts the reply at a leaked chat-template marker (the model started a new turn).
+    private static func trimAtTurnMarker(_ text: inout String) -> Bool {
+        for marker in ["<|im_end|>", "<|im_start|>", "<|endoftext|>", "<end_of_turn>"] {
+            if let range = text.range(of: marker) {
+                text = String(text[..<range.lowerBound])
+                return true
+            }
+        }
+        return false
+    }
+
+    private func setReply(_ id: UUID, _ text: String) {
+        guard let index = messages.firstIndex(where: { $0.id == id }) else { return }
+        messages[index].text = text
+        scrollTick += 1
+    }
+
+    func conversationText() -> String {
+        messages.filter { !$0.text.isEmpty }
+            .map { "\($0.role == .user ? "You" : "Assistant"): \($0.text)" }
+            .joined(separator: "\n\n")
     }
 
     func bench() async {
