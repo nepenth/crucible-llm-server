@@ -36,6 +36,12 @@ jobs:
           # Make it honour the env var (runner checkout only; submodule pin unchanged).
           sed -i '' 's/^IOS_MIN_OS_VERSION=16\.4$/IOS_MIN_OS_VERSION=${IOS_MIN_OS_VERSION:-16.4}/' build-xcframework.sh
           grep -n '^IOS_MIN_OS_VERSION=' build-xcframework.sh
+          # Accelerate BLAS is built against the iOS 16.4+ "NEWLAPACK" interface; on iOS 14
+          # cblas_sgemm$NEWLAPACK$ILP64 is a weak import that resolves to NULL, and the first
+          # prompt of 32+ tokens jumps to address 0 (device crash 2026-11-19). Use ggml's own
+          # CPU matrix code instead (runner checkout only; submodule pin unchanged).
+          sed -i '' 's/^GGML_BLAS_DEFAULT=ON$/GGML_BLAS_DEFAULT=OFF/' build-xcframework.sh
+          grep -n '^GGML_BLAS_DEFAULT=OFF$' build-xcframework.sh
           IOS_MIN_OS_VERSION=14.0 ./build-xcframework.sh
           ls -la build-apple/llama.xcframework/
 
@@ -81,6 +87,13 @@ jobs:
       - name: Verify iOS 14 deployment target
         run: |
           APP=$(ls -d Payload/*.app | head -1)
+          # No symbol may be weak-linked from an API newer than iOS 14 without a runtime check;
+          # Accelerate's NEWLAPACK/ILP64 symbols are iOS 16.4+ and are called unconditionally.
+          echo "Weak imports in llama.framework:"
+          nm -m "$APP/Frameworks/llama.framework/llama" | grep "weak external" || true
+          if nm -m "$APP/Frameworks/llama.framework/llama" | grep -E 'NEWLAPACK|ILP64'; then
+            echo "::error::llama.framework links iOS 16.4+ Accelerate symbols (NULL on iOS 14)"; exit 1
+          fi
           BIN="$APP/$(plutil -extract CFBundleExecutable raw "$APP/Info.plist")"
           FW="$APP/Frameworks/llama.framework/llama"
           MINOS_PLIST=$(plutil -extract MinimumOSVersion raw "$APP/Info.plist")
