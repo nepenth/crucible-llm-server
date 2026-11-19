@@ -24,7 +24,7 @@ struct ContentView: View {
                     VStack(spacing: 1) {
                         Text("Pocket Assistant")
                             .font(.headline)
-                        Text(llamaState.loadedModelName ?? "No model loaded")
+                        Text(llamaState.isLoadingModel ? "Loading model…" : (llamaState.loadedModelName ?? "No model loaded"))
                             .font(.caption2)
                             .foregroundColor(.secondary)
                             .lineLimit(1)
@@ -69,18 +69,17 @@ struct ContentView: View {
         @ObservedObject var llamaState: LlamaState
         @State private var showingHelp = false
         func delete(at offsets: IndexSet) {
-            offsets.forEach { offset in
-                let model = llamaState.downloadedModels[offset]
-                let fileURL = getDocumentsDirectory().appendingPathComponent(model.filename)
+            let filenames = offsets.map { llamaState.downloadedModels[$0].filename }
+            for filename in filenames {
+                let fileURL = getDocumentsDirectory().appendingPathComponent(filename)
                 do {
                     try FileManager.default.removeItem(at: fileURL)
                 } catch {
                     print("Error deleting file: \(error)")
                 }
             }
-
-            // Remove models from downloadedModels array
-            llamaState.downloadedModels.remove(atOffsets: offsets)
+            // Deleted catalog models reappear under "Download Models".
+            llamaState.didDelete(filenames: filenames)
         }
 
         func getDocumentsDirectory() -> URL {
@@ -89,21 +88,37 @@ struct ContentView: View {
         }
         var body: some View {
             List {
-                Section(header: Text("Download Models From Hugging Face")) {
-                    HStack {
-                        InputButton(llamaState: llamaState)
+                if llamaState.isLoadingModel {
+                    Section {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                            Text("Loading model…")
+                        }
                     }
                 }
-                Section(header: Text("Downloaded Models")) {
+                Section(header: Text("On This Phone"),
+                        footer: Text("Tap a model to load it. Swipe left to delete it and free space.")) {
+                    if llamaState.downloadedModels.isEmpty {
+                        Text("No models downloaded yet")
+                            .foregroundColor(.secondary)
+                    }
                     ForEach(llamaState.downloadedModels) { model in
                         DownloadButton(llamaState: llamaState, modelName: model.name, modelUrl: model.url, filename: model.filename)
                     }
                     .onDelete(perform: delete)
                 }
-                Section(header: Text("Default Models")) {
-                    ForEach(llamaState.undownloadedModels) { model in
-                        DownloadButton(llamaState: llamaState, modelName: model.name, modelUrl: model.url, filename: model.filename)
+                if !llamaState.undownloadedModels.isEmpty {
+                    Section(header: Text("Download Models"),
+                            footer: Text("Smallest first. Downloads need Wi-Fi or mobile data; keep the app open until they finish.")) {
+                        ForEach(llamaState.undownloadedModels) { model in
+                            DownloadButton(llamaState: llamaState, modelName: model.name, modelUrl: model.url,
+                                           filename: model.filename, sizeLabel: model.sizeLabel, isLarge: model.isLarge)
+                        }
                     }
+                }
+                Section(header: Text("Custom Link"),
+                        footer: Text("Paste a direct .gguf download link from Hugging Face.")) {
+                    InputButton(llamaState: llamaState)
                 }
 
             }
@@ -357,7 +372,7 @@ private struct SettingsView: View {
                     HStack {
                         Text("Loaded")
                         Spacer()
-                        Text(llamaState.loadedModelName ?? "None")
+                        Text(llamaState.isLoadingModel ? "Loading…" : (llamaState.loadedModelName ?? "None"))
                             .foregroundColor(.secondary)
                             .lineLimit(1)
                             .truncationMode(.middle)
@@ -402,6 +417,17 @@ private struct SettingsView: View {
                         Task { await llamaState.bench() }
                     }
                     .disabled(!llamaState.hasModel || llamaState.isGenerating)
+                }
+
+                Section(header: Text("Diagnostics"),
+                        footer: Text("A step-by-step record kept on the phone, with free memory at each step. If the app closes unexpectedly, copy this and send it along.")) {
+                    if let note = llamaState.previousCrashNote {
+                        Text(note)
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Button("Copy Diagnostics") { UIPasteboard.general.string = Diagnostics.recent(80) }
                 }
 
                 Section(header: Text("Activity Log")) {

@@ -5,8 +5,11 @@ struct DownloadButton: View {
     private var modelName: String
     private var modelUrl: String
     private var filename: String
+    private var sizeLabel: String?
+    private var isLarge: Bool
 
     @State private var status: String
+    @State private var errorText: String?
 
     @State private var downloadTask: URLSessionDownloadTask?
     @State private var progress = 0.0
@@ -16,61 +19,78 @@ struct DownloadButton: View {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent(filename)
     }
 
-    private func checkFileExistenceAndUpdateStatus() {
-    }
-
-    init(llamaState: LlamaState, modelName: String, modelUrl: String, filename: String) {
+    init(llamaState: LlamaState, modelName: String, modelUrl: String, filename: String,
+         sizeLabel: String? = nil, isLarge: Bool = false) {
         self.llamaState = llamaState
         self.modelName = modelName
         self.modelUrl = modelUrl
         self.filename = filename
+        self.sizeLabel = sizeLabel
+        self.isLarge = isLarge
 
         let fileURL = DownloadButton.getFileURL(filename: filename)
-        status = FileManager.default.fileExists(atPath: fileURL.path) ? "downloaded" : "download"
+        _status = State(initialValue: FileManager.default.fileExists(atPath: fileURL.path) ? "downloaded" : "download")
     }
 
     private func download() {
-        status = "downloading"
-        print("Downloading model \(modelName) from \(modelUrl)")
         guard let url = URL(string: modelUrl) else { return }
+        status = "downloading"
+        errorText = nil
+        progress = 0
+        // Large downloads take minutes; keep the screen on so iOS doesn't suspend the app mid-download.
+        UIApplication.shared.isIdleTimerDisabled = true
         let fileURL = DownloadButton.getFileURL(filename: filename)
+        let model = Model(name: modelName, url: modelUrl, filename: filename, status: "downloaded")
 
         downloadTask = URLSession.shared.downloadTask(with: url) { temporaryURL, response, error in
-            if let error = error {
-                print("Error: \(error.localizedDescription)")
-                return
-            }
-
-            guard let response = response as? HTTPURLResponse, (200...299).contains(response.statusCode) else {
-                print("Server error!")
-                return
-            }
-
-            do {
-                if let temporaryURL = temporaryURL {
-                    try FileManager.default.copyItem(at: temporaryURL, to: fileURL)
-                    print("Writing to \(filename) completed")
-
-                    llamaState.cacheCleared = false
-
-                    let model = Model(name: modelName, url: modelUrl, filename: filename, status: "downloaded")
-                    llamaState.downloadedModels.append(model)
-                    status = "downloaded"
+            // Runs on a background queue: move the file here (the temporary file is deleted when this
+            // returns), then hand every UI/state change to the main thread.
+            var failure: String?
+            if let error = error as NSError? {
+                failure = error.code == NSURLErrorCancelled ? nil : error.localizedDescription
+                if failure == nil { failure = "" }
+            } else if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                failure = "Server returned HTTP \(http.statusCode)"
+            } else if let temporaryURL {
+                do {
+                    try? FileManager.default.removeItem(at: fileURL)
+                    try FileManager.default.moveItem(at: temporaryURL, to: fileURL)
+                } catch {
+                    failure = "Could not save the file: \(error.localizedDescription)"
                 }
-            } catch let err {
-                print("Error: \(err.localizedDescription)")
+            } else {
+                failure = "Download failed"
+            }
+
+            DispatchQueue.main.async {
+                UIApplication.shared.isIdleTimerDisabled = false
+                observation = nil
+                if let failure {
+                    status = "download"
+                    errorText = failure.isEmpty ? nil : failure
+                } else {
+                    status = "downloaded"
+                    llamaState.cacheCleared = false
+                    llamaState.didDownload(model)
+                }
             }
         }
 
         observation = downloadTask?.progress.observe(\.fractionCompleted) { progress, _ in
-            self.progress = progress.fractionCompleted
+            DispatchQueue.main.async { self.progress = progress.fractionCompleted }
         }
 
         downloadTask?.resume()
     }
 
+    private var details: String {
+        [sizeLabel, isLarge ? "Large – slower, uses the most memory" : nil]
+            .compactMap { $0 }
+            .joined(separator: " · ")
+    }
+
     var body: some View {
-        VStack {
+        VStack(alignment: .leading, spacing: 2) {
             if status == "download" {
                 Button(action: download) {
                     Text("Download " + modelName)
@@ -80,7 +100,7 @@ struct DownloadButton: View {
                     downloadTask?.cancel()
                     status = "download"
                 }) {
-                    Text("\(modelName) (Downloading \(Int(progress * 100))%)")
+                    Text("\(modelName) – downloading \(Int(progress * 100))% – keep this screen open, tap to cancel")
                 }
             } else if status == "downloaded" {
                 Button(action: {
@@ -89,18 +109,26 @@ struct DownloadButton: View {
                         download()
                         return
                     }
-                    do {
-                        try llamaState.loadModel(modelUrl: fileURL)
-                    } catch let err {
-                        print("Error: \(err.localizedDescription)")
-                    }
+                    try? llamaState.loadModel(modelUrl: fileURL)
                 }) {
-                    Text("Load \(modelName)")
+                    Text(llamaState.loadedModelName == modelName ? "\(modelName) (loaded)" : "Load \(modelName)")
                 }
+                .disabled(llamaState.isLoadingModel || llamaState.isGenerating)
             } else {
                 Text("Unknown status")
             }
+            if !details.isEmpty {
+                Text(details)
+                    .font(.caption)
+                    .foregroundColor(isLarge ? .orange : .secondary)
+            }
+            if let errorText {
+                Text(errorText)
+                    .font(.caption)
+                    .foregroundColor(.red)
+            }
         }
+        .padding(.vertical, 2)
         .onDisappear() {
             downloadTask?.cancel()
         }
@@ -113,12 +141,3 @@ struct DownloadButton: View {
         }
     }
 }
-
-// #Preview {
-//    DownloadButton(
-//        llamaState: LlamaState(),
-//        modelName: "TheBloke / TinyLlama-1.1B-1T-OpenOrca-GGUF (Q4_0)",
-//        modelUrl: "https://huggingface.co/TheBloke/TinyLlama-1.1B-1T-OpenOrca-GGUF/resolve/main/tinyllama-1.1b-1t-openorca.Q4_0.gguf?download=true",
-//        filename: "tinyllama-1.1b-1t-openorca.Q4_0.gguf"
-//    )
-// }

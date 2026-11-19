@@ -10,15 +10,15 @@ struct InputButton: View {
     @State private var progress = 0.0
     @State private var observation: NSKeyValueObservation?
 
+    /// Uses the link's full file name (the old code cut it at the first ".", so
+    /// "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf" was saved as "Qwen2").
     private static func extractModelInfo(from link: String) -> (modelName: String, filename: String)? {
-        guard let url = URL(string: link),
-              let lastPathComponent = url.lastPathComponent.components(separatedBy: ".").first,
-              let modelName = lastPathComponent.components(separatedBy: "-").dropLast().joined(separator: "-").removingPercentEncoding,
-              let filename = lastPathComponent.removingPercentEncoding else {
+        guard let url = URL(string: link.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let filename = url.lastPathComponent.removingPercentEncoding,
+              filename.lowercased().hasSuffix(".gguf") else {
             return nil
         }
-
-        return (modelName, filename)
+        return (String(filename.dropLast(5)), filename)
     }
 
     private static func getFileURL(filename: String) -> URL {
@@ -36,38 +36,34 @@ struct InputButton: View {
 
         status = "downloading"
         print("Downloading model \(modelName) from \(inputLink)")
-        guard let url = URL(string: inputLink) else { return }
+        guard let url = URL(string: inputLink.trimmingCharacters(in: .whitespacesAndNewlines)) else { return }
         let fileURL = InputButton.getFileURL(filename: filename)
 
+        let model = Model(name: modelName, url: inputLink, filename: filename, status: "downloaded")
+        UIApplication.shared.isIdleTimerDisabled = true
         downloadTask = URLSession.shared.downloadTask(with: url) { temporaryURL, response, error in
-            if let error = error {
-                print("Error: \(error.localizedDescription)")
-                return
+            // Background queue: save the file here, then update state on the main thread.
+            var saved = false
+            if error == nil,
+               (response as? HTTPURLResponse).map({ (200...299).contains($0.statusCode) }) ?? false,
+               let temporaryURL {
+                try? FileManager.default.removeItem(at: fileURL)
+                saved = (try? FileManager.default.moveItem(at: temporaryURL, to: fileURL)) != nil
             }
-
-            guard let response = response as? HTTPURLResponse, (200...299).contains(response.statusCode) else {
-                print("Server error!")
-                return
-            }
-
-            do {
-                if let temporaryURL = temporaryURL {
-                    try FileManager.default.copyItem(at: temporaryURL, to: fileURL)
-                    print("Writing to \(filename) completed")
-
+            DispatchQueue.main.async {
+                UIApplication.shared.isIdleTimerDisabled = false
+                if saved {
                     llamaState.cacheCleared = false
-
-                    let model = Model(name: modelName, url: self.inputLink, filename: filename, status: "downloaded")
-                    llamaState.downloadedModels.append(model)
+                    llamaState.didDownload(model)
                     status = "downloaded"
+                } else {
+                    status = "download"
                 }
-            } catch let err {
-                print("Error: \(err.localizedDescription)")
             }
         }
 
         observation = downloadTask?.progress.observe(\.fractionCompleted) { progress, _ in
-            self.progress = progress.fractionCompleted
+            DispatchQueue.main.async { self.progress = progress.fractionCompleted }
         }
 
         downloadTask?.resume()
@@ -76,7 +72,7 @@ struct InputButton: View {
     var body: some View {
         VStack {
             HStack {
-                TextField("Paste Quantized Download Link", text: $inputLink)
+                TextField("https://…/model.gguf", text: $inputLink)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
 
                 Button(action: {
@@ -105,11 +101,7 @@ struct InputButton: View {
                         download()
                         return
                     }
-                    do {
-                        try llamaState.loadModel(modelUrl: fileURL)
-                    } catch let err {
-                        print("Error: \(err.localizedDescription)")
-                    }
+                    try? llamaState.loadModel(modelUrl: fileURL)
                 }) {
                     Text("Load Custom Model")
                 }

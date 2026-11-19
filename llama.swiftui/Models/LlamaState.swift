@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 struct Model: Identifiable {
     var id = UUID()
@@ -6,6 +7,65 @@ struct Model: Identifiable {
     var url: String
     var filename: String
     var status: String?
+    /// Download size shown next to catalog entries, e.g. "0.99 GB".
+    var sizeLabel: String? = nil
+    /// Marks the heavyweight option in the list.
+    var isLarge = false
+    /// Names older builds saved this file under (the old downloader cut names at the first ".").
+    var legacyFilenames: [String] = []
+}
+
+/// Breadcrumb log that survives a crash: each step is written to disk before it starts, so after
+/// an unexpected exit the next launch can say what the app was doing and how much memory was free.
+enum Diagnostics {
+    private static let maxLines = 300
+    private static let url: URL = {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("diagnostics.log")
+    }()
+
+    static func mark(_ event: String) {
+        let freeMB = os_proc_available_memory() / 1_048_576
+        let line = "\(timestamp()) [\(freeMB) MB free] \(event)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+            handle.synchronizeFile()
+            handle.closeFile()
+        } else {
+            try? data.write(to: url)
+        }
+    }
+
+    /// Recent log lines, newest last.
+    static func recent(_ count: Int = 40) -> String {
+        guard let text = try? String(contentsOf: url) else { return "" }
+        return text.split(separator: "\n").suffix(count).joined(separator: "\n")
+    }
+
+    /// Called once at launch: reports a step that began but never finished in the previous run,
+    /// then trims the log.
+    static func startSession() -> String? {
+        let previous = (try? String(contentsOf: url)) ?? ""
+        let lines = previous.split(separator: "\n").map(String.init)
+        var unfinished: String?
+        for line in lines.reversed() {
+            if line.contains("END ") || line.contains("APP START") { break }
+            if line.contains("BEGIN ") { unfinished = line; break }
+        }
+        let kept = lines.suffix(maxLines).joined(separator: "\n")
+        try? (kept.isEmpty ? "" : kept + "\n").write(to: url, atomically: true, encoding: .utf8)
+        mark("APP START")
+        return unfinished
+    }
+
+    private static func timestamp() -> String {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd HH:mm:ss"
+        return f.string(from: Date())
+    }
 }
 
 struct ChatMessage: Identifiable, Equatable {
@@ -27,6 +87,9 @@ class LlamaState: ObservableObject {
     @Published var messages: [ChatMessage] = []
     @Published var isGenerating = false
     @Published var loadedModelName: String?
+    @Published var isLoadingModel = false
+    /// Set at launch when the previous run ended in the middle of a step (likely a crash).
+    @Published var previousCrashNote: String?
     /// First message that was still inside the assistant's memory for the latest reply.
     @Published var memoryStartID: UUID?
     /// Bumped whenever streamed text is flushed, so the chat view can keep the newest text in view.
@@ -61,6 +124,10 @@ class LlamaState: ObservableObject {
     }
 
     init() {
+        if let unfinished = Diagnostics.startSession() {
+            previousCrashNote = "The app closed unexpectedly last time during: \(unfinished)"
+            messageLog += (previousCrashNote ?? "") + "\n"
+        }
         systemPrompt = UserDefaults.standard.string(forKey: Self.systemPromptKey) ?? defaultSystemPrompt
         loadModelsFromDisk()
         loadDefaultModels()
@@ -71,8 +138,9 @@ class LlamaState: ObservableObject {
             let documentsURL = getDocumentsDirectory()
             let modelURLs = try FileManager.default.contentsOfDirectory(at: documentsURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants])
             for modelURL in modelURLs {
-                let modelName = modelURL.deletingPathExtension().lastPathComponent
-                downloadedModels.append(Model(name: modelName, url: "", filename: modelURL.lastPathComponent, status: "downloaded"))
+                let filename = modelURL.lastPathComponent
+                let modelName = catalogEntry(forFilename: filename)?.name ?? modelURL.deletingPathExtension().lastPathComponent
+                downloadedModels.append(Model(name: modelName, url: "", filename: filename, status: "downloaded"))
             }
         } catch {
             print("Error loading models from disk: \(error)")
@@ -86,90 +154,122 @@ class LlamaState: ObservableObject {
             messageLog += "Error!\n"
         }
 
-        for model in defaultModels {
-            let fileURL = getDocumentsDirectory().appendingPathComponent(model.filename)
-            if FileManager.default.fileExists(atPath: fileURL.path) {
+        refreshCatalog()
+    }
 
-            } else {
-                var undownloadedModel = model
-                undownloadedModel.status = "download"
-                undownloadedModels.append(undownloadedModel)
+    /// Catalog entries whose file (under its current or a legacy name) is not on the phone.
+    func refreshCatalog() {
+        undownloadedModels = defaultModels.filter { model in
+            !([model.filename] + model.legacyFilenames).contains { name in
+                FileManager.default.fileExists(atPath: getDocumentsDirectory().appendingPathComponent(name).path)
             }
         }
+    }
+
+    func catalogEntry(forFilename filename: String) -> Model? {
+        defaultModels.first { $0.filename == filename || $0.legacyFilenames.contains(filename) }
+    }
+
+    /// Called by the downloaders on the main thread once a file is saved.
+    func didDownload(_ model: Model) {
+        downloadedModels.removeAll { $0.filename == model.filename }
+        downloadedModels.append(model)
+        refreshCatalog()
+        Diagnostics.mark("downloaded \(model.filename)")
+    }
+
+    func didDelete(filenames: [String]) {
+        downloadedModels.removeAll { filenames.contains($0.filename) }
+        refreshCatalog()
     }
 
     func getDocumentsDirectory() -> URL {
         let paths = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
         return paths[0]
     }
-    private let defaultModels: [Model] = [
+    /// Default download list for the iPhone 11 (4 GB RAM), small to large. Sizes and links from
+    /// the keep-survivalpi-phone-models packet (verified 2026-11-18).
+    let defaultModels: [Model] = [
         Model(
-            name: "Gemma-3-4B-IT (Q4_K_M, 2.9 GiB)",
-            url: "https://huggingface.co/bartowski/google_gemma-3-4b-it-GGUF/resolve/main/google_gemma-3-4b-it-Q4_K_M.gguf?download=true",
-            filename: "gemma-3-4b-it-Q4_K_M.gguf", status: "download"
+            name: "LFM2.5 1.2B Instruct",
+            url: "https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF/resolve/main/LFM2.5-1.2B-Instruct-Q4_K_M.gguf",
+            filename: "LFM2.5-1.2B-Instruct-Q4_K_M.gguf", status: "download",
+            sizeLabel: "0.73 GB", legacyFilenames: ["LFM2"]
         ),
         Model(
-            name: "Qwen-3.5-4B (Q4_K_M, 2.7 GiB)",
-            url: "https://huggingface.co/bartowski/Qwen_Qwen3.5-4B-GGUF/resolve/main/Qwen_Qwen3.5-4B-Q4_K_M.gguf?download=true",
-            filename: "qwen3.5-4b-Q4_K_M.gguf", status: "download"
-        ),
-        Model(name: "TinyLlama-1.1B (Q4_0, 0.6 GiB)",url: "https://huggingface.co/TheBloke/TinyLlama-1.1B-1T-OpenOrca-GGUF/resolve/main/tinyllama-1.1b-1t-openorca.Q4_0.gguf?download=true",filename: "tinyllama-1.1b-1t-openorca.Q4_0.gguf", status: "download"),
-        Model(
-            name: "TinyLlama-1.1B Chat (Q8_0, 1.1 GiB)",
-            url: "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q8_0.gguf?download=true",
-            filename: "tinyllama-1.1b-chat-v1.0.Q8_0.gguf", status: "download"
-        ),
-
-        Model(
-            name: "TinyLlama-1.1B (F16, 2.2 GiB)",
-            url: "https://huggingface.co/ggml-org/models/resolve/main/tinyllama-1.1b/ggml-model-f16.gguf?download=true",
-            filename: "tinyllama-1.1b-f16.gguf", status: "download"
-        ),
-
-        Model(
-            name: "Phi-2.7B (Q4_0, 1.6 GiB)",
-            url: "https://huggingface.co/ggml-org/models/resolve/main/phi-2/ggml-model-q4_0.gguf?download=true",
-            filename: "phi-2-q4_0.gguf", status: "download"
-        ),
-
-        Model(
-            name: "Phi-2.7B (Q8_0, 2.8 GiB)",
-            url: "https://huggingface.co/ggml-org/models/resolve/main/phi-2/ggml-model-q8_0.gguf?download=true",
-            filename: "phi-2-q8_0.gguf", status: "download"
-        ),
-
-        Model(
-            name: "Mistral-7B-v0.1 (Q4_0, 3.8 GiB)",
-            url: "https://huggingface.co/TheBloke/Mistral-7B-v0.1-GGUF/resolve/main/mistral-7b-v0.1.Q4_0.gguf?download=true",
-            filename: "mistral-7b-v0.1.Q4_0.gguf", status: "download"
+            name: "Atlas First Aid 1.5B",
+            url: "https://huggingface.co/Kami574/Atlas-FirstAid/resolve/main/Atlas-FirstAid.Q4_K_M.gguf",
+            filename: "Atlas-FirstAid.Q4_K_M.gguf", status: "download",
+            sizeLabel: "0.99 GB", legacyFilenames: ["Atlas-FirstAid"]
         ),
         Model(
-            name: "OpenHermes-2.5-Mistral-7B (Q3_K_M, 3.52 GiB)",
-            url: "https://huggingface.co/TheBloke/OpenHermes-2.5-Mistral-7B-GGUF/resolve/main/openhermes-2.5-mistral-7b.Q3_K_M.gguf?download=true",
-            filename: "openhermes-2.5-mistral-7b.Q3_K_M.gguf", status: "download"
-        )
+            name: "Qwen2.5 1.5B Instruct",
+            url: "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+            filename: "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf", status: "download",
+            sizeLabel: "0.99 GB", legacyFilenames: ["Qwen2"]
+        ),
+        Model(
+            name: "SmolLM2 1.7B Instruct",
+            url: "https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF/resolve/main/smollm2-1.7b-instruct-q4_k_m.gguf",
+            filename: "smollm2-1.7b-instruct-q4_k_m.gguf", status: "download",
+            sizeLabel: "1.06 GB", legacyFilenames: ["smollm2-1"]
+        ),
+        Model(
+            name: "Gemma 2 2B IT",
+            url: "https://huggingface.co/bartowski/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf",
+            filename: "gemma-2-2b-it-Q4_K_M.gguf", status: "download",
+            sizeLabel: "1.71 GB", legacyFilenames: ["gemma-2-2b-it-Q4_K_M"]
+        ),
+        Model(
+            name: "Llama 3.2 3B Instruct",
+            url: "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+            filename: "Llama-3.2-3B-Instruct-Q4_K_M.gguf", status: "download",
+            sizeLabel: "2.02 GB", isLarge: true, legacyFilenames: ["Llama-3"]
+        ),
     ]
-    func loadModel(modelUrl: URL?) throws {
-        if let modelUrl {
-            guard !isGenerating else {
-                messageLog += "Stop the current reply before switching models\n"
-                return
-            }
-            messageLog += "Loading model...\n"
-            llamaContext = try LlamaContext.create_context(path: modelUrl.path)
-            loadedModelName = modelUrl.deletingPathExtension().lastPathComponent
-            if UserDefaults.standard.string(forKey: Self.systemPromptKey) == nil {
-                systemPrompt = defaultSystemPrompt
-            }
-            messageLog += "Loaded model \(modelUrl.lastPathComponent)\n"
 
-            // Assuming that the model is successfully loaded, update the downloaded models
-            updateDownloadedModels(modelName: modelUrl.lastPathComponent, status: "downloaded")
-        } else {
+    /// Loads a model off the main thread. The previous model is released first so two models are
+    /// never in memory at once (4 GB phone), and taps while a load is running are ignored.
+    func loadModel(modelUrl: URL?) throws {
+        guard let modelUrl else {
             messageLog += "Load a model from the list below\n"
+            return
+        }
+        guard !isGenerating else {
+            messageLog += "Stop the current reply before switching models\n"
+            return
+        }
+        guard !isLoadingModel else { return }
+
+        let filename = modelUrl.lastPathComponent
+        let displayName = catalogEntry(forFilename: filename)?.name ?? modelUrl.deletingPathExtension().lastPathComponent
+        isLoadingModel = true
+        llamaContext = nil
+        loadedModelName = nil
+        messageLog += "Loading \(displayName)...\n"
+        Diagnostics.mark("BEGIN load \(filename)")
+
+        let path = modelUrl.path
+        Task {
+            do {
+                let context = try await Task.detached(priority: .userInitiated) {
+                    try LlamaContext.create_context(path: path)
+                }.value
+                llamaContext = context
+                loadedModelName = displayName
+                if UserDefaults.standard.string(forKey: Self.systemPromptKey) == nil {
+                    systemPrompt = defaultSystemPrompt
+                }
+                messageLog += "Loaded \(filename)\n"
+                Diagnostics.mark("END load \(filename)")
+                updateDownloadedModels(modelName: filename, status: "downloaded")
+            } catch {
+                messageLog += "Could not load \(filename). The file may be incomplete; delete it and download again.\n"
+                Diagnostics.mark("END load failed \(filename)")
+            }
+            isLoadingModel = false
         }
     }
-
 
     private func updateDownloadedModels(modelName: String, status: String) {
         undownloadedModels.removeAll { $0.name == modelName }
@@ -272,9 +372,12 @@ class LlamaState: ObservableObject {
         }
         memoryStartID = built.firstID
 
+        let promptTokens = await context.token_count(text: built.prompt)
+        Diagnostics.mark("BEGIN reply (\(promptTokens)-token prompt, \(history.count) messages)")
         let t_start = DispatchTime.now().uptimeNanoseconds
         await context.completion_init(text: built.prompt)
         let t_first = DispatchTime.now().uptimeNanoseconds
+        Diagnostics.mark("prompt read in \(String(format: "%.1f", Double(t_first - t_start) / NS_PER_S)) s")
 
         var reply = ""
         var pending = ""
@@ -306,11 +409,12 @@ class LlamaState: ObservableObject {
         let secondsToFirst = Double(t_first - t_start) / NS_PER_S
         let tokensPerSecond = Double(nTokens) / max(Double(t_end - t_first) / NS_PER_S, 0.001)
         lastStats = String(format: "%.1f tok/s, first word after %.1f s", tokensPerSecond, secondsToFirst)
+        Diagnostics.mark("END reply (\(nTokens) tokens, \(lastStats ?? ""))")
     }
 
     /// Cuts the reply at a leaked chat-template marker (the model started a new turn).
     private static func trimAtTurnMarker(_ text: inout String) -> Bool {
-        for marker in ["<|im_end|>", "<|im_start|>", "<|endoftext|>", "<end_of_turn>"] {
+        for marker in ["<|im_end|>", "<|im_start|>", "<|endoftext|>", "<end_of_turn>", "<start_of_turn>", "<|eot_id|>", "<|start_header_id|>"] {
             if let range = text.range(of: marker) {
                 text = String(text[..<range.lowerBound])
                 return true
