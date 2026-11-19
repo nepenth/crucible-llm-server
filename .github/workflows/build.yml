@@ -28,39 +28,13 @@ jobs:
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           echo "iphoneos SDK minimum deployment target: $(plutil -extract SupportedTargets.iphoneos.MinimumDeploymentTarget raw "$SDK/SDKSettings.plist")"
 
-      - name: Build llama.cpp xcframework
+      - name: Build llama.cpp xcframework (iPhone 11 / A13 only)
         run: |
-          cd llama.cpp
-          chmod +x build-xcframework.sh
-          # The script hard-codes IOS_MIN_OS_VERSION=16.4, overriding the environment.
-          # Make it honour the env var (runner checkout only; submodule pin unchanged).
-          sed -i '' 's/^IOS_MIN_OS_VERSION=16\.4$/IOS_MIN_OS_VERSION=${IOS_MIN_OS_VERSION:-16.4}/' build-xcframework.sh
-          grep -n '^IOS_MIN_OS_VERSION=' build-xcframework.sh
-          # Accelerate BLAS is built against the iOS 16.4+ "NEWLAPACK" interface; on iOS 14
-          # cblas_sgemm$NEWLAPACK$ILP64 is a weak import that resolves to NULL, and the first
-          # prompt of 32+ tokens jumps to address 0 (device crash 2026-11-19). Use ggml's own
-          # CPU matrix code instead (runner checkout only; submodule pin unchanged).
-          # ggml/CMakeLists.txt re-sets GGML_BLAS_DEFAULT=ON for Apple, so pass GGML_BLAS=OFF itself.
-          perl -i -pe 's/^(\s*)-DGGML_BLAS_DEFAULT=\$\{GGML_BLAS_DEFAULT\}$/$&\n$1-DGGML_BLAS=OFF/' build-xcframework.sh
-          grep -n 'DGGML_BLAS' build-xcframework.sh
-          grep -q '^ *-DGGML_BLAS=OFF$' build-xcframework.sh
-          # ...and drop libggml-blas.a from the static libraries it merges into the framework.
-          sed -i '' '/libggml-blas\.a"/d' build-xcframework.sh
-          if grep -n 'libggml-blas' build-xcframework.sh; then echo "::error::libggml-blas still listed"; exit 1; fi
-          IOS_MIN_OS_VERSION=14.0 ./build-xcframework.sh
-          ls -la build-apple/llama.xcframework/
-
-      - name: Check Metal shaders compile for iOS 14 (Metal 2.3)
-        continue-on-error: true
-        run: |
-          # The app compiles this embedded source on-device at runtime; on iOS 14 the
-          # language level is Metal 2.3. iPhone 11 (Apple6) sets GGML_METAL_HAS_BF16.
-          SRC=$(find llama.cpp/build-ios-device -name ggml-metal-embed.metal | head -1)
-          echo "Source: $SRC"
-          xcrun -sdk iphoneos metal -c -std=ios-metal2.3 -target air64-apple-ios14.0 \
-            -DGGML_METAL_EMBED_LIBRARY=1 -DGGML_METAL_HAS_BF16=1 \
-            "$SRC" -o "$RUNNER_TEMP/ggml-ios14.air"
-          echo "Metal 2.3 compile OK"
+          # iOS device slice only, iOS 14.0, CPU-only (no Metal, no Accelerate BLAS),
+          # CPU code compiled for the A13. See ci/build-llama-iphone11.sh for why.
+          chmod +x ci/build-llama-iphone11.sh
+          ci/build-llama-iphone11.sh
+          ls -la llama.cpp/build-apple/llama.xcframework/
 
       - name: Build iOS app
         run: |
@@ -98,6 +72,10 @@ jobs:
           nm -m "$APP/Frameworks/llama.framework/llama" | grep "weak external" || true
           if nm -m "$APP/Frameworks/llama.framework/llama" | grep -E 'NEWLAPACK|ILP64'; then
             echo "::error::llama.framework links iOS 16.4+ Accelerate symbols (NULL on iOS 14)"; exit 1
+          fi
+          # CPU-only build for the A13: the Metal backend must not be compiled in.
+          if nm "$APP/Frameworks/llama.framework/llama" | grep -q ggml_backend_metal_reg; then
+            echo "::error::Metal backend is still linked"; exit 1
           fi
           BIN="$APP/$(plutil -extract CFBundleExecutable raw "$APP/Info.plist")"
           FW="$APP/Frameworks/llama.framework/llama"

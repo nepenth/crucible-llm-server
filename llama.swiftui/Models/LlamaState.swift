@@ -115,6 +115,20 @@ class LlamaState: ObservableObject {
     private static let systemPromptKey = "customSystemPrompt"
     private static let lastModelKey = "lastModelFilename"
     private static let briefAnswersKey = "briefAnswers"
+    private static let threadsKey = "generationThreads"
+    private static let batchThreadsKey = "promptThreads"
+
+    /// CPU threads used while writing a reply. The A13 has 2 fast and 4 efficiency cores;
+    /// the Speed Test in Settings measures which count is fastest on this phone.
+    @Published var generationThreads: Int = UserDefaults.standard.object(forKey: LlamaState.threadsKey) as? Int ?? 4 {
+        didSet { UserDefaults.standard.set(generationThreads, forKey: Self.threadsKey); applyThreads() }
+    }
+    /// CPU threads used while reading the prompt (batched work scales with more cores).
+    @Published var promptThreads: Int = UserDefaults.standard.object(forKey: LlamaState.batchThreadsKey) as? Int ?? 4 {
+        didSet { UserDefaults.standard.set(promptThreads, forKey: Self.batchThreadsKey); applyThreads() }
+    }
+    @Published var isTuning = false
+    @Published var tuningReport: String?
     /// Reply length cap while "Brief answers" is on: shorter replies save battery and time.
     private let briefReplyTokenCap = 320
 
@@ -348,6 +362,7 @@ class LlamaState: ObservableObject {
                 let context = try await Task.detached(priority: .userInitiated) {
                     try LlamaContext.create_context(path: path)
                 }.value
+                await context.set_threads(generation: generationThreads, batch: promptThreads)
                 llamaContext = context
                 loadedModelName = displayName
                 if UserDefaults.standard.string(forKey: Self.systemPromptKey) == nil {
@@ -558,6 +573,47 @@ class LlamaState: ObservableObject {
         messages.filter { !$0.text.isEmpty }
             .map { "\($0.role == .user ? "You" : "Assistant"): \($0.text)" }
             .joined(separator: "\n\n")
+    }
+
+    private func applyThreads() {
+        guard let llamaContext else { return }
+        let generation = generationThreads, batch = promptThreads
+        Task { await llamaContext.set_threads(generation: generation, batch: batch) }
+    }
+
+    /// Tries 2, 3, 4 and 6 threads on the loaded model and keeps the fastest settings.
+    func tuneThreads() async {
+        guard let llamaContext, !isGenerating, !isTuning else { return }
+        isTuning = true
+        isGenerating = true // blocks sending and model switching while measuring
+        UIApplication.shared.isIdleTimerDisabled = true
+        defer {
+            isTuning = false
+            isGenerating = false
+            UIApplication.shared.isIdleTimerDisabled = false
+        }
+        Diagnostics.mark("BEGIN speed test")
+        await llamaContext.set_threads(generation: 4, batch: 4)
+        _ = await llamaContext.measure_speed(pp: 16, tg: 4) // warm up caches and clocks
+
+        var lines: [String] = []
+        var bestWrite = (threads: generationThreads, speed: 0.0)
+        var bestRead = (threads: promptThreads, speed: 0.0)
+        for threads in [2, 3, 4, 6] {
+            tuningReport = "Testing \(threads) threads…"
+            await llamaContext.set_threads(generation: threads, batch: threads)
+            let speed = await llamaContext.measure_speed(pp: 64, tg: 24)
+            lines.append(String(format: "%d threads: write %.1f tok/s, read %.0f tok/s", threads, speed.write, speed.read))
+            if speed.write > bestWrite.speed { bestWrite = (threads, speed.write) }
+            if speed.read > bestRead.speed { bestRead = (threads, speed.read) }
+        }
+        generationThreads = bestWrite.threads
+        promptThreads = bestRead.threads
+        await llamaContext.set_threads(generation: generationThreads, batch: promptThreads)
+        lines.append("Using \(generationThreads) threads for writing, \(promptThreads) for reading.")
+        tuningReport = lines.joined(separator: "\n")
+        messageLog += "Speed test (\(loadedModelName ?? "model")):\n" + tuningReport! + "\n"
+        Diagnostics.mark("END speed test: write \(generationThreads), read \(promptThreads)")
     }
 
     func bench() async {

@@ -459,7 +459,8 @@ private struct SettingsView: View {
                     }
                 }
 
-                Section(header: Text("Performance")) {
+                Section(header: Text("Performance"),
+                        footer: Text("The Speed Test tries 2, 3, 4 and 6 threads on the loaded model (about a minute) and keeps the fastest. Fewer threads also use less battery.")) {
                     HStack {
                         Text("Last reply")
                         Spacer()
@@ -467,10 +468,22 @@ private struct SettingsView: View {
                             .font(.footnote)
                             .foregroundColor(.secondary)
                     }
-                    Button("Run Benchmark") {
-                        Task { await llamaState.bench() }
+                    Stepper("Threads for writing: \(llamaState.generationThreads)",
+                            value: $llamaState.generationThreads, in: 1...6)
+                        .disabled(llamaState.isGenerating)
+                    Stepper("Threads for reading: \(llamaState.promptThreads)",
+                            value: $llamaState.promptThreads, in: 1...6)
+                        .disabled(llamaState.isGenerating)
+                    Button(llamaState.isTuning ? "Testing…" : "Run Speed Test") {
+                        Task { await llamaState.tuneThreads() }
                     }
                     .disabled(!llamaState.hasModel || llamaState.isGenerating)
+                    if let report = llamaState.tuningReport {
+                        Text(report)
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
 
                 Section(header: Text("Diagnostics"),

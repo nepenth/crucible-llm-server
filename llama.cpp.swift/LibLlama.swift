@@ -274,7 +274,7 @@ actor LlamaContext {
         let model_desc     = model_info();
         let model_size     = String(format: "%.2f GiB", Double(llama_model_size(model)) / 1024.0 / 1024.0 / 1024.0);
         let model_n_params = String(format: "%.2f B", Double(llama_model_n_params(model)) / 1e9);
-        let backend        = "Metal";
+        let backend        = "CPU";
         let pp_avg_str     = String(format: "%.2f", pp_avg);
         let tg_avg_str     = String(format: "%.2f", tg_avg);
         let pp_std_str     = String(format: "%.2f", pp_std);
@@ -288,6 +288,32 @@ actor LlamaContext {
         result += String("| \(model_desc) | \(model_size) | \(model_n_params) | \(backend) | tg \(tg) | \(tg_avg_str) ± \(tg_std_str) |\n")
 
         return result;
+    }
+
+    /// Threads for writing a reply (one token at a time) and for reading the prompt (batched).
+    func set_threads(generation: Int, batch: Int) {
+        llama_set_n_threads(context, Int32(generation), Int32(batch))
+    }
+
+    /// Quick speed probe: tokens/s for reading a `pp`-token prompt and writing `tg` tokens.
+    func measure_speed(pp: Int, tg: Int) -> (read: Double, write: Double) {
+        llama_memory_clear(llama_get_memory(context), false)
+        llama_batch_clear(&batch)
+        for i in 0..<pp { llama_batch_add(&batch, 0, Int32(i), [0], false) }
+        batch.logits[Int(batch.n_tokens) - 1] = 1
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        _ = llama_decode(context, batch)
+        llama_synchronize(context)
+        let t1 = DispatchTime.now().uptimeNanoseconds
+        for i in 0..<tg {
+            llama_batch_clear(&batch)
+            llama_batch_add(&batch, 0, Int32(pp + i), [0], true)
+            _ = llama_decode(context, batch)
+            llama_synchronize(context)
+        }
+        let t2 = DispatchTime.now().uptimeNanoseconds
+        llama_memory_clear(llama_get_memory(context), false)
+        return (Double(pp) / (Double(t1 - t0) / 1e9), Double(tg) / (Double(t2 - t1) / 1e9))
     }
 
     /// Number of tokens `text` occupies in the prompt (including BOS when the model uses one).
