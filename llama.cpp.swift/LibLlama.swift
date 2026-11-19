@@ -62,6 +62,10 @@ actor LlamaContext {
     static func create_context(path: String) throws -> LlamaContext {
         llama_backend_init()
         var model_params = llama_model_default_params()
+        // Keep weights memory-mapped from the file. With the A13 (dot-product) build, ggml would
+        // otherwise repack Q4_K/Q4_0 weights into a faster layout in app memory, i.e. copy the
+        // whole model (2 GB for a 3B model) into dirty memory and exceed iOS's ~2 GB app limit.
+        model_params.use_extra_bufts = false
 
 #if targetEnvironment(simulator)
         model_params.n_gpu_layers = 0
