@@ -44,6 +44,9 @@ jobs:
           perl -i -pe 's/^(\s*)-DGGML_BLAS_DEFAULT=\$\{GGML_BLAS_DEFAULT\}$/$&\n$1-DGGML_BLAS=OFF/' build-xcframework.sh
           grep -n 'DGGML_BLAS' build-xcframework.sh
           grep -q '^ *-DGGML_BLAS=OFF$' build-xcframework.sh
+          # ...and drop libggml-blas.a from the static libraries it merges into the framework.
+          sed -i '' '/libggml-blas\.a"/d' build-xcframework.sh
+          if grep -n 'libggml-blas' build-xcframework.sh; then echo "::error::libggml-blas still listed"; exit 1; fi
           IOS_MIN_OS_VERSION=14.0 ./build-xcframework.sh
           ls -la build-apple/llama.xcframework/
 
