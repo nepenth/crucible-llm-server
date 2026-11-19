@@ -40,8 +40,10 @@ jobs:
           # cblas_sgemm$NEWLAPACK$ILP64 is a weak import that resolves to NULL, and the first
           # prompt of 32+ tokens jumps to address 0 (device crash 2026-11-19). Use ggml's own
           # CPU matrix code instead (runner checkout only; submodule pin unchanged).
-          sed -i '' 's/^GGML_BLAS_DEFAULT=ON$/GGML_BLAS_DEFAULT=OFF/' build-xcframework.sh
-          grep -n '^GGML_BLAS_DEFAULT=OFF$' build-xcframework.sh
+          # ggml/CMakeLists.txt re-sets GGML_BLAS_DEFAULT=ON for Apple, so pass GGML_BLAS=OFF itself.
+          perl -i -pe 's/^(\s*)-DGGML_BLAS_DEFAULT=\$\{GGML_BLAS_DEFAULT\}$/$&\n$1-DGGML_BLAS=OFF/' build-xcframework.sh
+          grep -n 'DGGML_BLAS' build-xcframework.sh
+          grep -q '^ *-DGGML_BLAS=OFF$' build-xcframework.sh
           IOS_MIN_OS_VERSION=14.0 ./build-xcframework.sh
           ls -la build-apple/llama.xcframework/
 
