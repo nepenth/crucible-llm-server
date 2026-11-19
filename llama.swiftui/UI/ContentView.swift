@@ -415,6 +415,13 @@ private struct SettingsView: View {
     @ObservedObject var llamaState: LlamaState
     @Environment(\.presentationMode) private var presentationMode
 
+    private var appVersion: String {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        return "\(version) (build \(build))"
+    }
+
     var body: some View {
         NavigationView {
             Form {
@@ -483,6 +490,15 @@ private struct SettingsView: View {
                             .font(.footnote)
                             .foregroundColor(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+                Section(header: Text("About")) {
+                    HStack {
+                        Text("Version")
+                        Spacer()
+                        Text(appVersion)
+                            .foregroundColor(.secondary)
                     }
                 }
 

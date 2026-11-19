@@ -47,6 +47,7 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             DEVELOPMENT_TEAM="" \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} \
             -derivedDataPath build
 
       - name: Package IPA
@@ -55,13 +56,18 @@ jobs:
           echo "Found app at: $APP_PATH"
           mkdir -p Payload
           cp -r "$APP_PATH" Payload/
-          zip -r CrucibleLLM.ipa Payload/
+          # Name the IPA by version and build number (build = this workflow's run number).
+          VERSION=$(plutil -extract CFBundleShortVersionString raw Payload/*.app/Info.plist)
+          BUILD=$(plutil -extract CFBundleVersion raw Payload/*.app/Info.plist)
+          echo "App version $VERSION (build $BUILD)"
+          [ "$BUILD" = "${{ github.run_number }}" ] || { echo "::error::build number is $BUILD"; exit 1; }
+          zip -qr "PocketAssistant-$VERSION-build$BUILD.ipa" Payload/
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: CrucibleLLM
-          path: CrucibleLLM.ipa
+          name: PocketAssistant-ipa
+          path: PocketAssistant-*.ipa
 
       - name: Verify iOS 14 deployment target
         run: |
